@@ -109,11 +109,12 @@ A scan is one explicit action, never a background sweep:
    Home Assistant, Syncthing, ESPHome, workstations, and a few printers.
    AirPlay, Chromecast, and companion-link noise is ignored.
 3. Add online Tailscale peers.
-4. Probe 15 common ports on at most 32 hosts, 32 connects at a time, with a
+4. Probe 16 common ports on at most 32 hosts, 32 connects at a time, with a
    0.3 s timeout.
-5. Read response headers from at most 16 of those open web ports. That is how
-   an AirPlay receiver on 5000 becomes “AirPlay Receiver” instead of a
-   misleading “Dev server”.
+5. Read response headers and short page titles from at most 16 of those open
+   web ports. That is how an AirPlay receiver on 5000 becomes “AirPlay
+   Receiver”, and a Synology NAS becomes “Synology DSM” / “Synology Web
+   Station” instead of a misleading “Dev server”.
 
 Only RFC1918, loopback, Tailscale CGNAT, and IPv6 ULA/link-local addresses are
 accepted. A poisoned mDNS record cannot turn the scan into an internet scanner.
@@ -161,7 +162,7 @@ Layout:
 - `Service.qml` — polling, config watch/write, actions, scans.
 - `lib/Model.js` — pure logic, also loaded by the Node tests.
 - `lib/collect.sh` — local and network discovery, probe-many.
-- `test/model.test.js` — 20 tests.
+- `test/model.test.js` — 21 tests.
 - `examples/services.conf` — synthetic sample entries.
 
 `scripts/check-pii.sh` scans everything that would be committed and fails on

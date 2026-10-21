@@ -17,8 +17,8 @@ export LC_ALL=C
 
 PROBE_TIMEOUT="0.30"
 NET_HOST_CAP=32
-PROBE_PORTS=(22 53 80 443 3000 5000 631 8000 8080 8096 8123 8443 9090 19999 32400)
-# Only these open ports get an HTTP header check. Kept small so a scan stays
+PROBE_PORTS=(22 53 80 443 3000 5000 5001 631 8000 8080 8096 8123 8443 9090 19999 32400)
+# Only these open ports get an HTTP fingerprint. Kept small so a scan stays
 # interactive even when several hosts hang instead of answering.
 HTTP_PORTS=(80 443 3000 5000 5001 8000 8080 8096 8123 8443 9000 9090 19999 32400)
 SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
@@ -285,10 +285,12 @@ cmd_network() {
   done
   ((${#fingerprint_pairs[@]} > 16)) && fingerprint_pairs=("${fingerprint_pairs[@]:0:16}")
   if ((${#fingerprint_pairs[@]} > 0)); then
-    while IFS=$'\t' read -r ip port server; do
-      [[ -n ${ip:-} && -n ${port:-} && -n ${server:-} ]] || continue
-      records+=$(jq -nc --arg ip "$ip" --argjson port "$port" --arg server "$server" \
-        '{kind:"fingerprint", ip:$ip, port:$port, server:$server}')$'\n'
+    while IFS=$'\x1f' read -r ip port server title synology; do
+      [[ -n ${ip:-} && -n ${port:-} ]] || continue
+      records+=$(jq -nc --arg ip "$ip" --argjson port "$port" \
+        --arg server "${server:-}" --arg title "${title:-}" --argjson synology "${synology:-0}" \
+        '{kind:"fingerprint", ip:$ip, port:$port, server:$server, title:$title,
+          synology:($synology == 1)}')$'\n'
     done < <(printf '%s\n' "${fingerprint_pairs[@]}" |
       xargs -P 8 -n 2 bash "$SELF" fingerprint 2>/dev/null)
   fi
@@ -308,7 +310,7 @@ cmd_network() {
       elif $r.kind == "fingerprint" then
         .[$r.ip] = (.[$r.ip] // {ip:$r.ip, name:"", sources:[], services:[]})
         | .[$r.ip].services = ([.[$r.ip].services[]
-            | if .port == $r.port then . + {server:$r.server} else . end])
+            | if .port == $r.port then . + {server:$r.server, title:$r.title, synology:$r.synology} else . end])
       else . end)
     | [ .[] | select((.services | length) > 0) ]
     | map(.services |= sort_by(.port))
@@ -328,21 +330,33 @@ cmd_network() {
     '{hosts:$hosts, warnings:$warnings, probes:$probed, scannedAt:(now|floor)}'
 }
 
-# Reads response headers from a suspected web port and prints
-# "ip<TAB>port<TAB>Server". AirPlay receivers answer 403 with an AirTunes
-# server header, which is how the panel stops calling them dev servers.
+# Reads response headers and the page title from a suspected web port.
+# Prints "ip<US>port<US>Server<US>Title<US>synology" where US is the unit
+# separator (an empty tab-separated field would be lost to IFS collapsing).
+# AirPlay answers with an AirTunes server header; Synology pages mention
+# their vendor name, which is how the panel stops calling them dev servers.
 cmd_fingerprint() {
-  local ip="${1:-}" port="${2:-}" scheme=http server
+  local ip="${1:-}" port="${2:-}" scheme=http response server title synology
   is_safe_host "$ip" || return 0
   is_safe_port "$port" || return 0
   [[ $ip == *:* ]] && return 0
-  case "$port" in 443 | 8443) scheme=https ;; esac
-  server=$(curl -ksS -m 1.5 -D - -o /dev/null --max-filesize 1 \
-    "$scheme://$ip:$port/" 2>/dev/null |
+  case "$port" in 443 | 8443 | 5001) scheme=https ;; esac
+  response=$(curl -ksS -m 2 -D - --max-filesize 200000 "$scheme://$ip:$port/" 2>/dev/null)
+  [[ -n $response ]] || return 0
+  server=$(printf '%s\n' "$response" |
     awk 'BEGIN { IGNORECASE = 1 } /^server:/ { sub(/^[Ss]erver:[ ]*/, ""); sub(/[[:space:]]+$/, ""); print; exit }')
-  [[ -n $server ]] || return 0
-  server=${server//$'\t'/ }
-  printf '%s\t%s\t%s\n' "$ip" "$port" "$server"
+  title=$(printf '%s' "$response" |
+    awk 'BEGIN { body = 0 } body { print } /^\r?$/ { body = 1 }' |
+    tr '\n\r\t' '    ' |
+    sed -n 's:.*<title[^>]*>\([^<]*\)</title>.*:\1:p' | head -n 1 |
+    sed -e 's/&nbsp;/ /g' -e 's/&amp;/\&/g' -e 's/&quot;/"/g' -e "s/&#39;/'/g" |
+    tr -s ' ' | sed 's/^ //; s/ $//' | cut -c1-200)
+  synology=0
+  printf '%s' "$response" | grep -qi 'synology' && synology=1
+  [[ -n $server || -n $title || $synology == 1 ]] || return 0
+  # Unit separator, not a tab: bash collapses runs of whitespace IFS, which
+  # would silently drop empty server/title fields.
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$ip" "$port" "$server" "$title" "$synology"
 }
 
 cmd_probe_many() {
@@ -390,7 +404,7 @@ fingerprint)
   shift || true
   cmd_fingerprint "$@"
   ;;
-version) printf '{"version":"0.2.0"}\n' ;;
+version) printf '{"version":"0.3.0"}\n' ;;
 *)
   printf 'usage: collect.sh {local|network|probe-many|fingerprint|version}\n' >&2
   exit 2

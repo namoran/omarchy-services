@@ -201,6 +201,33 @@ test("network rows are pin-addressable and labelled by port when mDNS is silent"
   assert.equal(rows[0].pinnable, true)
 })
 
+test("Synology DSM, Web Station, and the 5000 redirect are labelled", () => {
+  const network = {
+    hosts: [{
+      ip: "192.0.2.20", name: "nas.local", sources: ["tailscale"], services: [
+        { port: 80, name: "", source: "probe", server: "nginx",
+          title: "Hello! Welcome to Synology Web Station!", synology: true },
+        { port: 5000, name: "", source: "probe", server: "nginx", title: "", synology: false },
+        { port: 5001, name: "", source: "probe", server: "nginx",
+          title: "File Archive", synology: true },
+        { port: 32400, name: "", source: "probe", server: "", title: "Unauthorized", synology: false }
+      ]
+    }]
+  }
+  const rows = Model.networkRows(network, [])
+  const byPort = {}
+  for (const row of rows) byPort[row.port] = row
+  assert.equal(byPort[80].title, "Synology Web Station")
+  assert.equal(byPort[5000].title, "Synology DSM")
+  assert.match(byPort[5000].subtitle, /redirects to :5001/)
+  assert.equal(byPort[5001].title, "File Archive")
+  assert.match(byPort[5001].subtitle, /DSM web UI/)
+  assert.equal(byPort[5001].entry.scheme, "https")
+  assert.equal(byPort[5001].pinnable, true)
+  assert.equal(byPort[32400].title, "Plex")
+  assert.doesNotMatch(byPort[32400].subtitle, /DSM/)
+})
+
 test("AirPlay on port 5000 is labelled and not offered for pinning", () => {
   const network = {
     hosts: [{
