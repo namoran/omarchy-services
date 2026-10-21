@@ -111,6 +111,9 @@ A scan is one explicit action, never a background sweep:
 3. Add online Tailscale peers.
 4. Probe 15 common ports on at most 32 hosts, 32 connects at a time, with a
    0.3 s timeout.
+5. Read response headers from at most 16 of those open web ports. That is how
+   an AirPlay receiver on 5000 becomes “AirPlay Receiver” instead of a
+   misleading “Dev server”.
 
 Only RFC1918, loopback, Tailscale CGNAT, and IPv6 ULA/link-local addresses are
 accepted. A poisoned mDNS record cannot turn the scan into an internet scanner.
@@ -146,7 +149,7 @@ error.
 ## Development
 
 ```bash
-npm test                 # model, config round-trip, filters, validation
+npm test                 # model, config round-trip, filters, AirPlay labelling, validation
 bash -n lib/collect.sh   # discovery script syntax
 npm run check:pii        # refuse private addresses, tailnet names, emails, MACs
 omarchy plugin validate .
@@ -158,7 +161,7 @@ Layout:
 - `Service.qml` — polling, config watch/write, actions, scans.
 - `lib/Model.js` — pure logic, also loaded by the Node tests.
 - `lib/collect.sh` — local and network discovery, probe-many.
-- `test/model.test.js` — 19 tests.
+- `test/model.test.js` — 20 tests.
 - `examples/services.conf` — synthetic sample entries.
 
 `scripts/check-pii.sh` scans everything that would be committed and fails on
@@ -171,6 +174,8 @@ addresses. Run it before every push.
   otherwise the panel says so and lists no containers.
 - mDNS discovery is intentionally a whitelist, not "every advertised service".
 - Probe state means "TCP connect succeeded", not "the application is healthy".
+- AirPlay receivers have no web page; a 403 on port 5000 is normal. They are
+  labelled and shown without a pin star.
 - One instance per shell; multiple widgets are disabled in the manifest.
 - systemd actions follow polkit policy. Cancelling the prompt leaves the service
   untouched and the panel reports the failure.

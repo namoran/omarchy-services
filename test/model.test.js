@@ -198,6 +198,23 @@ test("network rows are pin-addressable and labelled by port when mDNS is silent"
   assert.equal(rows.find(row => row.port === 443).entry.scheme, "https")
   assert.equal(Model.portLabel(8096), "Jellyfin")
   assert.equal(Model.portLabel(65535), "Port 65535")
+  assert.equal(rows[0].pinnable, true)
+})
+
+test("AirPlay on port 5000 is labelled and not offered for pinning", () => {
+  const network = {
+    hosts: [{
+      ip: "192.0.2.10", name: "mini.local", sources: ["tailscale"],
+      services: [{ port: 5000, name: "", source: "probe", server: "AirTunes/950.7.1" }]
+    }]
+  }
+  const rows = Model.networkRows(network, [])
+  assert.equal(rows[0].title, "AirPlay Receiver")
+  assert.equal(rows[0].pinnable, false)
+  assert.match(rows[0].subtitle, /no web UI/)
+  assert.equal(rows[0].entry.name, "AirPlay Receiver")
+  assert.equal(Model.isAirPlayServer("AirTunes/950.7.1"), true)
+  assert.equal(Model.isAirPlayServer("nginx/1.24.0"), false)
 })
 
 test("pinned rows and summary report issues, not just presence", () => {

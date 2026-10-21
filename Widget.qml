@@ -478,6 +478,7 @@ Panel {
               serviceState: root.rowState(modelData)
               stateLabel: ""
               pinned: modelData.pinned
+              pinnable: modelData.pinnable !== false
               showAction: false
               onPinClicked: root.togglePin(modelData)
             }
@@ -556,6 +557,7 @@ Panel {
     property bool showAction: false
     property string actionVerb: "start"
     property bool actionEnabled: true
+    property bool pinnable: true
     signal pinClicked()
     signal actionClicked()
 
@@ -642,6 +644,7 @@ Panel {
 
       Text {
         id: pinText
+        visible: row.pinnable
         text: row.pinned ? "★" : "☆"
         color: row.pinned
           ? Commons.Color.accent
