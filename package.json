@@ -1,6 +1,6 @@
 {
   "name": "omarchy-services",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Curated systemd units, containers, and network services in the Omarchy bar.",
   "license": "MIT",

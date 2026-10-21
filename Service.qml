@@ -113,10 +113,12 @@ Item {
     probeProc.running = true
   }
 
-  function runAction(entry) {
+  function runAction(entry, verbOverride) {
     if (!entry || acting) return
     var state = Model.entryState(entry, context).state
     var verb = (state === "active") ? "stop" : (state === "failed" ? "restart" : "start")
+    if (verbOverride === "start" || verbOverride === "stop" || verbOverride === "restart")
+      verb = verbOverride
     var command = null
     if (entry.type === "unit") {
       command = entry.scope === "user" ? ["/usr/bin/systemctl", "--user", verb, entry.unit]
@@ -133,9 +135,30 @@ Item {
       return
     }
     actionError = ""
-    actionMessage = verb + " " + (entry.name || entry.unit || entry.name)
+    actionMessage = verb + " " + (entry.name || entry.unit || "")
     actionProc.command = command
     actionProc.running = true
+  }
+
+  // Open actions come from Model.probeAction. Re-check here too: these values
+  // reach an argv array, never a shell, but a leading dash must not become an
+  // ssh option.
+  function runOpen(action) {
+    if (!action) return
+    if (action.kind === "open") {
+      var url = String(action.url || "")
+      if (!/^https?:\/\//.test(url)) return
+      Quickshell.execDetached(["omarchy-launch-browser", url])
+    } else if (action.kind === "ssh") {
+      var host = String(action.host || "")
+      var port = Number(action.port)
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(host)) return
+      if (!isFinite(port) || port < 1 || port > 65535) return
+      var command = ["omarchy-launch-terminal", "ssh"]
+      if (port !== 22) command.push("-p", String(port))
+      command.push(host)
+      Quickshell.execDetached(command)
+    }
   }
 
   function scanNetwork() {

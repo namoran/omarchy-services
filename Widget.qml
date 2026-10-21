@@ -37,6 +37,14 @@ Panel {
     return Commons.Color.muted
   }
 
+  function isIssueState(state) {
+    return state === "failed" || state === "inactive" || state === "missing"
+  }
+
+  function canRestart(kind, state) {
+    return (kind === "unit" || kind === "container") && state === "active"
+  }
+
   function actionVerbFor(state) {
     if (state === "active") return "stop"
     if (state === "failed") return "restart"
@@ -237,9 +245,10 @@ Panel {
               }
               Text {
                 text: root.summaryText
-                color: root.dim
+                color: services.summary.issues > 0 ? Commons.Color.urgent : root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+                font.weight: services.summary.issues > 0 ? Font.Medium : Font.Normal
               }
             }
 
@@ -345,11 +354,16 @@ Panel {
               serviceState: modelData.state
               stateLabel: modelData.stateLabel
               pinned: true
+              alert: root.isIssueState(modelData.state)
               showAction: modelData.kind === "unit" || modelData.kind === "container"
               actionVerb: root.actionVerbFor(modelData.state)
               actionEnabled: !services.acting
+              showRestart: root.canRestart(modelData.kind, modelData.state)
+              openLabel: modelData.action ? modelData.action.label : ""
               onPinClicked: services.unpin(modelData.id)
               onActionClicked: services.runAction(modelData.entry)
+              onRestartClicked: services.runAction(modelData.entry, "restart")
+              onOpenClicked: services.runOpen(modelData.action)
             }
           }
 
@@ -404,8 +418,16 @@ Panel {
               serviceState: root.rowState(modelData)
               stateLabel: modelData.scope === "user" ? "user" : (modelData.scope === "local" ? "this computer" : "system")
               pinned: modelData.pinned
-              showAction: false
+              alert: modelData.pinned && root.isIssueState(root.rowState(modelData))
+              showAction: modelData.kind === "unit" || modelData.kind === "container"
+              actionVerb: root.actionVerbFor(root.rowState(modelData))
+              actionEnabled: !services.acting
+              showRestart: root.canRestart(modelData.kind, root.rowState(modelData))
+              openLabel: modelData.action ? modelData.action.label : ""
               onPinClicked: root.togglePin(modelData)
+              onActionClicked: services.runAction(modelData.entry)
+              onRestartClicked: services.runAction(modelData.entry, "restart")
+              onOpenClicked: services.runOpen(modelData.action)
             }
           }
 
@@ -479,8 +501,11 @@ Panel {
               stateLabel: ""
               pinned: modelData.pinned
               pinnable: modelData.pinnable !== false
+              alert: modelData.pinned && root.isIssueState(root.rowState(modelData))
               showAction: false
+              openLabel: modelData.action ? modelData.action.label : ""
               onPinClicked: root.togglePin(modelData)
+              onOpenClicked: services.runOpen(modelData.action)
             }
           }
 
@@ -558,21 +583,28 @@ Panel {
     property string actionVerb: "start"
     property bool actionEnabled: true
     property bool pinnable: true
+    property bool alert: false
+    property bool showRestart: false
+    property string openLabel: ""
     signal pinClicked()
     signal actionClicked()
+    signal restartClicked()
+    signal openClicked()
 
     width: column.width
     implicitHeight: Math.max(Style.space(44), textColumn.implicitHeight + Style.space(14))
     radius: Style.space(6)
     color: rowHover.containsMouse || pinHover.containsMouse || actionHover.containsMouse
-      ? root.selectedFill : "transparent"
+      || restartHover.containsMouse || openHover.containsMouse
+      ? root.selectedFill
+      : (row.alert ? Qt.rgba(Commons.Color.urgent.r, Commons.Color.urgent.g, Commons.Color.urgent.b, 0.07) : "transparent")
 
     Rectangle {
       id: dot
       width: Style.space(6)
       height: width
       radius: width / 2
-      color: root.toneFor(row.serviceState)
+      color: row.alert ? Commons.Color.urgent : root.toneFor(row.serviceState)
       anchors {
         left: parent.left
         leftMargin: Style.space(10)
@@ -602,10 +634,11 @@ Panel {
       Text {
         width: parent.width
         text: row.subtitle + (row.stateLabel !== "" ? " · " + row.stateLabel : "")
-        color: root.dim
+        color: row.alert ? Commons.Color.urgent : root.dim
         elide: Text.ElideRight
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
+        font.weight: row.alert ? Font.Medium : Font.Normal
       }
     }
 
@@ -616,6 +649,48 @@ Panel {
         right: parent.right
         rightMargin: Style.space(6)
         verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        id: openText
+        visible: row.openLabel !== ""
+        text: row.openLabel
+        color: openHover.containsMouse ? Commons.Color.accent : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        leftPadding: Style.space(6)
+        rightPadding: Style.space(6)
+        topPadding: Style.space(6)
+        bottomPadding: Style.space(6)
+
+        MouseArea {
+          id: openHover
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: row.openClicked()
+        }
+      }
+
+      Text {
+        id: restartText
+        visible: row.showRestart
+        text: "restart"
+        color: restartHover.containsMouse ? Commons.Color.accent : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        leftPadding: Style.space(6)
+        rightPadding: Style.space(6)
+        topPadding: Style.space(6)
+        bottomPadding: Style.space(6)
+
+        MouseArea {
+          id: restartHover
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: row.restartClicked()
+        }
       }
 
       Text {

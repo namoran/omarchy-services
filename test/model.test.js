@@ -194,6 +194,7 @@ test("network rows are pin-addressable and labelled by port when mDNS is silent"
   const rows = Model.networkRows(network, [])
   assert.equal(rows[0].id, "probe:pi.tailnet.example:443")
   assert.equal(rows[0].title, "HTTPS")
+  assert.equal(rows[0].action.url, "https://pi.tailnet.example/")
   assert.equal(rows[1].entry.scheme, undefined)
   assert.equal(rows.find(row => row.port === 443).entry.scheme, "https")
   assert.equal(Model.portLabel(8096), "Jellyfin")
@@ -240,6 +241,7 @@ test("AirPlay on port 5000 is labelled and not offered for pinning", () => {
   assert.equal(rows[0].pinnable, false)
   assert.match(rows[0].subtitle, /no web UI/)
   assert.equal(rows[0].entry.name, "AirPlay Receiver")
+  assert.equal(rows[0].action, null)
   assert.equal(Model.isAirPlayServer("AirTunes/950.7.1"), true)
   assert.equal(Model.isAirPlayServer("nginx/1.24.0"), false)
 })
@@ -257,7 +259,9 @@ test("pinned rows and summary report issues, not just presence", () => {
   const rows = Model.pinnedRows(entries, ctx)
   assert.equal(rows.length, 2)
   assert.equal(rows[0].state, "active")
+  assert.equal(rows[0].action, null)
   assert.equal(rows[1].stateLabel, "unreachable")
+  assert.equal(rows[1].action.url, "http://nas/")
   assert.deepEqual(Model.summary(entries.filter(entry => entry.pinned), ctx), { total: 2, running: 1, issues: 1 })
 })
 
@@ -285,4 +289,31 @@ test("docker containers appear as machine rows and pin like units", () => {
     Model.entryState({ type: "container", name: "backup" }, { docker: { containers } }).label,
     "exited"
   )
+})
+
+test("probe actions open web pages and ssh terminals", () => {
+  assert.equal(Model.probeProtocol(22), "ssh")
+  assert.equal(Model.probeProtocol(443), "web")
+  assert.equal(Model.probeProtocol(53), "")
+
+  assert.deepEqual(
+    Model.probeAction({ type: "probe", host: "192.0.2.10", port: 443 }),
+    { kind: "open", label: "open", url: "https://192.0.2.10/" }
+  )
+  assert.equal(Model.probeAction({ type: "probe", host: "nas.local", port: 5001 }).url,
+    "https://nas.local:5001/")
+  assert.equal(Model.probeAction({ type: "probe", host: "nas.local", port: 80 }).url,
+    "http://nas.local/")
+  assert.equal(Model.probeAction({ type: "probe", host: "nas.local", port: 8080 }).url,
+    "http://nas.local:8080/")
+  assert.equal(Model.probeAction({ type: "probe", host: "nas.local", port: 9090 }).url,
+    "https://nas.local:9090/")
+  assert.deepEqual(
+    Model.probeAction({ type: "probe", host: "nas.local", port: 22 }),
+    { kind: "ssh", label: "ssh", host: "nas.local", port: 22 }
+  )
+  assert.equal(Model.probeAction({ type: "probe", host: "nas.local", port: 53 }), null)
+  assert.equal(Model.probeAction({ type: "probe", host: "-oProxyCommand=x", port: 22 }), null)
+  assert.equal(Model.probeAction({ type: "probe", host: "2001:db8::10", port: 8080 }).url,
+    "http://[2001:db8::10]:8080/")
 })

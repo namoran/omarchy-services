@@ -1,29 +1,34 @@
 # Services
 
 Curated system services in the Omarchy bar: pin the handful you actually care
-about, see whether they are up, start or stop them, and discover what is running
-on this machine and on your local network without opening a dashboard.
+about, see whether they are up, start, stop, or restart them, and discover what
+is running on this machine and on your local network without opening a
+dashboard.
 
 Everything stays on the machine. There is no telemetry, no remote API, and no
 background daemon.
 
 ## What it does
 
-- **Pinned tab** — the services you chose, with live state and start/stop
-  buttons. Clicking a filled star unpins; the line stays in the config as a
-  comment so re-pinning is one click.
+- **Pinned tab** — the services you chose, with live state and contextual
+  action buttons. Clicking a filled star unpins; the line stays in the config
+  as a comment so re-pinning is one click. Rows that need attention are tinted
+  red, with a red dot and state text.
 - **This machine** — running systemd units (system and user), plus unattributed
   listeners found through `ss`, plus Docker containers when the socket is
   readable.
 - **Network** — an explicit scan of ARP neighbours, a whitelist of useful mDNS
   service types, and online Tailscale peers. Only private addresses are probed,
   and only a short fixed port list is checked.
-- **Bar icon** — a gear that dims when nothing is running and gains a small red
-  dot when a pinned service is stopped, failed, or unreachable.
+- **Bar icon** — a gear that dims when nothing is running, turns red, and gains
+  a small red dot when a pinned service is stopped, failed, or unreachable.
+- **Actions** — web services get `open` (default browser), SSH gets `ssh` (a
+  terminal), and running units/containers get `restart` alongside start/stop.
+  Other ports get no open button rather than a misleading guess.
 
-Units are started and stopped through `systemctl` (system units prompt through
-polkit). Containers use `docker start` / `docker stop`. Probes are plain TCP
-connects; they only report reachability.
+Units are started, stopped, and restarted through `systemctl` (system units
+prompt through polkit). Containers use `docker start` / `docker stop` /
+`docker restart`. Probes are plain TCP connects; they only report reachability.
 
 ## Requirements
 
@@ -69,7 +74,9 @@ Open the panel from the gear in the bar.
 | `Esc` | Close |
 
 Click a row's star to pin or unpin. Network rows are pinned by hostname when
-mDNS or Tailscale provides one, otherwise by IP address.
+mDNS or Tailscale provides one, otherwise by IP address. The buttons on each
+row are context-sensitive: `open` for a web UI, `ssh` for a terminal, and
+start/stop/restart for units and containers where those actions apply.
 
 Right-clicking the bar icon refreshes without opening the panel.
 
@@ -162,7 +169,7 @@ Layout:
 - `Service.qml` — polling, config watch/write, actions, scans.
 - `lib/Model.js` — pure logic, also loaded by the Node tests.
 - `lib/collect.sh` — local and network discovery, probe-many.
-- `test/model.test.js` — 21 tests.
+- `test/model.test.js` — 22 tests.
 - `examples/services.conf` — synthetic sample entries.
 
 `scripts/check-pii.sh` scans everything that would be committed and fails on
