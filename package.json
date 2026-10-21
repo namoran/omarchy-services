@@ -1,0 +1,12 @@
+{
+  "name": "omarchy-services",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Curated systemd units, containers, and network services in the Omarchy bar.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check:pii": "bash scripts/check-pii.sh",
+    "check": "npm test && bash -n lib/collect.sh && bash scripts/check-pii.sh"
+  }
+}

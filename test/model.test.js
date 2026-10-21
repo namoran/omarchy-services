@@ -1,0 +1,244 @@
+const test = require("node:test")
+const assert = require("node:assert/strict")
+const Model = require("../lib/Model.js")
+
+function unitEntry(overrides) {
+  return Object.assign(
+    { type: "unit", scope: "system", unit: "docker.service", name: "docker" },
+    overrides || {}
+  )
+}
+
+test("a fresh config is only the header", () => {
+  const parsed = Model.parseConfigText(Model.HEADER)
+  assert.equal(parsed.entries.length, 0)
+  assert.deepEqual(parsed.errors, [])
+})
+
+test("pin then unpin then pin is lossless", () => {
+  const first = Model.pinText(Model.HEADER, unitEntry())
+  const second = Model.pinText(first, unitEntry({ name: "containers" }))
+  assert.equal(first, second, "pinning an already-pinned entry is a no-op")
+
+  const unpinned = Model.unpinText(first, "unit:system:docker.service")
+  assert.ok(unpinned.includes('// {"id":"unit:system:docker.service"'), unpinned)
+  assert.equal(
+    Model.parseConfigText(unpinned).entries[0].pinned,
+    false,
+    "commented entries are still parsed, as unpinned"
+  )
+
+  const repinned = Model.pinText(unpinned, unitEntry())
+  assert.equal(repinned, first, "re-pin restores the original line byte for byte")
+  assert.deepEqual(Model.parseConfigText(repinned).entries[0], Object.assign(unitEntry(), {
+    id: "unit:system:docker.service",
+    pinned: true
+  }))
+})
+
+test("pin appends in one line and leaves comments alone", () => {
+  const text = "# my notes\n// {\"id\":\"probe:nas:8096\",\"type\":\"probe\",\"host\":\"nas\",\"port\":8096,\"name\":\"Jellyfin\"}\n"
+  const next = Model.pinText(text, unitEntry())
+  const lines = next.trimEnd().split("\n")
+  assert.equal(lines[0], "# my notes")
+  assert.ok(lines[1].startsWith("// "))
+  assert.equal(lines[2], '{"id":"unit:system:docker.service","type":"unit","scope":"system","unit":"docker.service","name":"docker"}')
+})
+
+test("unpin only touches the matching active line", () => {
+  const a = Model.pinText(Model.HEADER, unitEntry())
+  const b = Model.pinText(a, { type: "probe", host: "127.0.0.1", port: 8080, name: "web" })
+  const unpinned = Model.unpinText(b, "probe:127.0.0.1:8080")
+  assert.ok(unpinned.includes('{"id":"unit:system:docker.service"'))
+  assert.ok(unpinned.includes('// {"id":"probe:127.0.0.1:8080"'))
+  assert.equal(Model.unpinText(unpinned, "probe:127.0.0.1:8080").match(/^\/\/.*probe/gm).length, 1)
+})
+
+test("malformed lines are reported and do not hide valid ones", () => {
+  const text = Model.HEADER + '{"id":"unit:system:docker.service","type":"unit","scope":"system","unit":"docker.service"}\nnot json\n{"type":"nope"}\n'
+  const parsed = Model.parseConfigText(text)
+  assert.equal(parsed.entries.length, 1)
+  assert.equal(parsed.errors.length, 2)
+  assert.equal(parsed.errors[0].line, 5)
+  assert.equal(Model.configErrorsText(parsed.errors), "services.conf line 5: not valid JSON")
+})
+
+test("duplicate ids are rejected instead of silently merged", () => {
+  const line = '{"id":"unit:system:docker.service","type":"unit","scope":"system","unit":"docker.service"}\n'
+  const parsed = Model.parseConfigText(Model.HEADER + line + line)
+  assert.equal(parsed.entries.length, 1)
+  assert.equal(parsed.errors[0].message, "duplicate id")
+})
+
+test("unit names cannot smuggle options or paths", () => {
+  const bad = [
+    "-oProxyCommand=x.service",
+    "../../etc/passwd.service",
+    "docker.service; rm -rf /",
+    "docker",
+    "docker.service\n"
+  ]
+  for (const unit of bad) assert.notEqual(Model.validateEntry(unitEntry({ unit })), "", unit)
+
+  assert.equal(Model.validateEntry(unitEntry({ unit: "tailscaled.service" })), "")
+  assert.equal(Model.validateEntry(unitEntry({ scope: "user", unit: "rclone-a.service" })), "")
+  assert.equal(Model.validateEntry(unitEntry({ scope: "root" })), "unit scope must be user or system")
+})
+
+test("probe entries validate host and port", () => {
+  assert.equal(Model.validateEntry({ type: "probe", host: "nas.local", port: 8096 }), "")
+  assert.equal(Model.validateEntry({ type: "probe", host: "192.0.2.10", port: 443 }), "")
+  assert.notEqual(Model.validateEntry({ type: "probe", host: "host with space", port: 80 }), "")
+  assert.notEqual(Model.validateEntry({ type: "probe", host: "ok", port: 0 }), "")
+  assert.notEqual(Model.validateEntry({ type: "probe", host: "ok", port: 65536 }), "")
+  assert.notEqual(Model.validateEntry({ type: "probe", host: "ok", port: 80.5 }), "")
+  assert.notEqual(Model.validateEntry({ type: "probe", host: "ok", port: 80, scheme: "ftp" }), "")
+})
+
+test("ids are stable and scope-aware", () => {
+  assert.equal(Model.entryId(unitEntry()), "unit:system:docker.service")
+  assert.equal(Model.entryId(unitEntry({ scope: "user" })), "unit:user:docker.service")
+  assert.equal(Model.entryId({ type: "container", name: "jellyfin" }), "container:jellyfin")
+  assert.equal(Model.entryId({ type: "probe", host: "nas", port: 80 }), "probe:nas:80")
+})
+
+test("serialization is canonical and drops UI-only fields", () => {
+  const line = Model.serializeEntry(Object.assign(unitEntry({ pinned: true, extra: "x" }), {
+    stopUnits: ["docker.socket", "containerd.service"]
+  }))
+  assert.equal(
+    line,
+    '{"id":"unit:system:docker.service","type":"unit","scope":"system","unit":"docker.service","name":"docker","stopUnits":["docker.socket","containerd.service"]}'
+  )
+})
+
+test("control characters never reach a label", () => {
+  assert.equal(Model.cleanLabel("  evil\u0000\u001b[31mname\n\t"), "evil [31mname")
+  assert.equal(Model.cleanLabel("x".repeat(100), 10).length, 10)
+})
+
+test("systemd json is parsed with scope and failure state", () => {
+  const raw = JSON.stringify([
+    { unit: "docker.service", load: "loaded", active: "active", sub: "running", description: "Docker" },
+    { unit: "not-a-unit", load: "loaded", active: "active", sub: "running", description: "x" },
+    { unit: "cups.service", load: "loaded", active: "inactive", sub: "failed", description: "Printing" }
+  ])
+  const units = Model.parseUnitsJson(raw, "system")
+  assert.equal(units.length, 2)
+  assert.equal(units[0].scope, "system")
+  assert.equal(units[1].active, false)
+  assert.deepEqual(Model.parseUnitsJson("garbage", "user"), [])
+})
+
+test("infrastructure units stay out of the machine list", () => {
+  const units = [
+    { name: "dbus-broker.service", label: "D-Bus", active: true, sub: "running", load: "loaded", scope: "user" },
+    { name: "rclone-backup.service", label: "rclone backup", active: true, sub: "running", load: "loaded", scope: "user" },
+    { name: "cups.service", label: "Printing", active: false, sub: "dead", load: "loaded", scope: "system" }
+  ]
+  const running = Model.machineRows([], units, [], [], false)
+  assert.deepEqual(running.map(row => row.title), ["rclone-backup"])
+  assert.equal(Model.isInfraUnit("gvfs-daemon.service"), true)
+  assert.equal(Model.isInfraUnit("gvfsd.service"), false)
+})
+
+test("listeners without a unit become probes, not fake units", () => {
+  const listeners = [
+    { addr: "127.0.0.1", port: 5173, process: "node", pid: "42", unit: "", scope: "" },
+    { addr: "0.0.0.0", port: 631, process: "", pid: "", unit: "cups.service", scope: "system" }
+  ]
+  const rows = Model.machineRows([], [], listeners, [], false)
+  const local = rows.find(row => row.kind === "probe")
+  assert.equal(local.id, "probe:127.0.0.1:5173")
+  assert.equal(local.entry.host, "127.0.0.1")
+  assert.equal(rows.find(row => row.id === "unit:system:cups.service").kind, "unit")
+})
+
+test("entry state comes from the matching scope only", () => {
+  const ctx = {
+    systemUnits: [{ name: "docker.service", active: true, sub: "running" }],
+    userUnits: [{ name: "docker.service", active: false, sub: "failed" }],
+    docker: { containers: [{ name: "jellyfin", state: "running" }] },
+    probes: { "nas:8096": true, "nas:1": false }
+  }
+  assert.equal(Model.entryState(unitEntry(), ctx).state, "active")
+  assert.equal(Model.entryState(unitEntry({ scope: "user" }), ctx).state, "failed")
+  assert.equal(Model.entryState(unitEntry({ unit: "missing.service" }), ctx).state, "missing")
+  assert.equal(Model.entryState({ type: "container", name: "jellyfin" }, ctx).state, "active")
+  assert.equal(Model.entryState({ type: "container", name: "gone" }, ctx).state, "missing")
+  assert.equal(Model.entryState({ type: "probe", id: "probe:nas:8096", host: "nas", port: 8096 }, ctx).state, "active")
+  assert.equal(Model.entryState({ type: "probe", id: "probe:nas:1", host: "nas", port: 1 }, ctx).state, "inactive")
+  assert.equal(Model.entryState({ type: "probe", id: "probe:nas:2", host: "nas", port: 2 }, ctx).state, "unknown")
+})
+
+test("probe pairs are only built for pinned probes", () => {
+  const entries = [
+    Object.assign({ type: "probe", host: "nas", port: 8096, pinned: true }, { id: "probe:nas:8096" }),
+    Object.assign({ type: "unit", scope: "system", unit: "docker.service", pinned: true }, { id: "unit:system:docker.service" }),
+    Object.assign({ type: "probe", host: "nas", port: 80, pinned: false }, { id: "probe:nas:80" })
+  ]
+  assert.equal(Model.probePairs(entries), "nas 8096")
+  assert.deepEqual(Model.parseProbeJson('{"nas:8096":true}'), { "nas:8096": true })
+  assert.deepEqual(Model.parseProbeJson("nope"), {})
+})
+
+test("network rows are pin-addressable and labelled by port when mDNS is silent", () => {
+  const network = {
+    hosts: [
+      { ip: "192.0.2.10", name: "pi.tailnet.example", sources: ["tailscale"], services: [
+        { port: 443, name: "", source: "probe" },
+        { port: 8080, name: "", source: "probe" }
+      ] }
+    ]
+  }
+  const rows = Model.networkRows(network, [])
+  assert.equal(rows[0].id, "probe:pi.tailnet.example:443")
+  assert.equal(rows[0].title, "HTTPS")
+  assert.equal(rows[1].entry.scheme, undefined)
+  assert.equal(rows.find(row => row.port === 443).entry.scheme, "https")
+  assert.equal(Model.portLabel(8096), "Jellyfin")
+  assert.equal(Model.portLabel(65535), "Port 65535")
+})
+
+test("pinned rows and summary report issues, not just presence", () => {
+  const entries = [
+    Object.assign(unitEntry({ name: "Docker" }), { id: "unit:system:docker.service", pinned: true }),
+    Object.assign({ type: "probe", host: "nas", port: 80, name: "NAS" }, { id: "probe:nas:80", pinned: true }),
+    Object.assign(unitEntry({ unit: "cups.service", name: "Printing" }), { id: "unit:system:cups.service", pinned: false })
+  ]
+  const ctx = {
+    systemUnits: [{ name: "docker.service", active: true, sub: "running" }],
+    probes: { "nas:80": false }
+  }
+  const rows = Model.pinnedRows(entries, ctx)
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].state, "active")
+  assert.equal(rows[1].stateLabel, "unreachable")
+  assert.deepEqual(Model.summary(entries.filter(entry => entry.pinned), ctx), { total: 2, running: 1, issues: 1 })
+})
+
+test("docker containers appear as machine rows and pin like units", () => {
+  const containers = [
+    { name: "jellyfin", image: "jellyfin/jellyfin", state: "running", status: "Up 3 hours" },
+    { name: "backup", image: "restic/restic", state: "exited", status: "Exited (0) 2 hours ago" }
+  ]
+  const rows = Model.machineRows([], [], [], [], false, containers)
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].kind, "container")
+  assert.equal(rows[0].id, "container:jellyfin")
+  assert.equal(rows[0].active, true)
+  assert.match(rows[0].subtitle, /jellyfin\/jellyfin/)
+
+  const next = Model.pinText(Model.HEADER, rows[0].entry)
+  const parsed = Model.parseConfigText(next)
+  assert.equal(parsed.entries[0].type, "container")
+  assert.equal(parsed.entries[0].pinned, true)
+  assert.equal(
+    Model.entryState(parsed.entries[0], { docker: { containers } }).state,
+    "active"
+  )
+  assert.equal(
+    Model.entryState({ type: "container", name: "backup" }, { docker: { containers } }).label,
+    "exited"
+  )
+})

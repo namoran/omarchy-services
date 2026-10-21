@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# Discovery helper for the Services bar widget.
+#
+# Everything sensitive is read here, on this machine, and printed as JSON on
+# stdout. Nothing is cached, uploaded, or written to the config file.
+#
+#   collect.sh local        units, listeners, containers on this machine
+#   collect.sh network      neighbours, mDNS services, tailnet peers, probes
+#   collect.sh probe-many   reachability for "host port" pairs on stdin
+#
+# The output of every command is a single JSON object. Diagnostics go to
+# stderr; a failure never produces half a document.
+
+set -uo pipefail
+export PATH="/usr/local/bin:/usr/bin:/bin"
+export LC_ALL=C
+
+PROBE_TIMEOUT="0.30"
+NET_HOST_CAP=32
+PROBE_PORTS=(22 53 80 443 3000 5000 631 8000 8080 8096 8123 8443 9090 19999 32400)
+
+json_escape() { jq -Rr . <<<"${1:-}"; }
+
+# avahi-browse escapes non-printable and separator characters as decimal
+# \DDD sequences (e.g. \058 for ':'). Decode for display; the raw value never
+# leaves this machine either way.
+avahi_unescape() {
+  local s="$1" out="" c n
+  while [[ -n $s ]]; do
+    c="${s:0:1}"
+    if [[ $c == '\' ]]; then
+      n="${s:1:3}"
+      if [[ $n =~ ^[0-9]{3}$ ]]; then
+        out+=$(printf "\\$(printf '%03o' "$((10#$n))")")
+        s="${s:4}"
+      else
+        out+="${s:1:1}"
+        s="${s:2}"
+      fi
+    else
+      out+="$c"
+      s="${s:1}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# Only service types a person would plausibly pin. AirPlay receivers, Google
+# Casts, and companion links are deliberately excluded: they flood busy
+# networks and are not services you start or stop.
+is_useful_service_type() {
+  case "$1" in
+  _http._tcp | _https._tcp | _ssh._tcp | _sftp-ssh._tcp | _smb._tcp | _afpovertcp._tcp | \
+    _nfs._tcp | _ipp._tcp | _ipps._tcp | _printer._tcp | _plexmediasvr._tcp | \
+    _home-assistant._tcp | _syncthing._tcp | _esphomelib._tcp | _workstation._tcp | \
+    _device-info._tcp | _rfb._tcp | _mqtt._tcp | _postgresql._tcp | _mysql._tcp) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+# RFC1918, loopback, CGNAT (Tailscale), and IPv6 ULA/link-local only. Anything
+# public is refused so a poisoned mDNS record cannot turn this into an internet
+# scanner.
+is_private_ip() {
+  local ip="$1" a b c d
+  if [[ $ip == *:* ]]; then
+    case "$ip" in
+    ::1 | fc* | fd* | fe80:*) return 0 ;;
+    *) return 1 ;;
+    esac
+  fi
+  IFS=. read -r a b c d <<<"$ip" || return 1
+  [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ && $c =~ ^[0-9]+$ && $d =~ ^[0-9]+$ ]] || return 1
+  ((a == 10)) && return 0
+  ((a == 192 && b == 168)) && return 0
+  ((a == 172 && b >= 16 && b <= 31)) && return 0
+  ((a == 100 && b >= 64 && b <= 127)) && return 0
+  ((a == 127)) && return 0
+  return 1
+}
+
+is_safe_host() {
+  [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$ ]]
+}
+
+is_safe_port() {
+  [[ ${1:-} =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+probe_port() {
+  local host="$1" port="$2"
+  timeout "$PROBE_TIMEOUT" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null
+}
+
+unit_from_pid() {
+  local pid="$1" cg seg
+  [[ -n $pid && -r /proc/$pid/cgroup ]] || return 0
+  cg=$(tail -n 1 "/proc/$pid/cgroup" 2>/dev/null) || return 0
+  seg="${cg##*/}"
+  [[ $seg == *.service || $seg == *.scope ]] || return 0
+  if [[ $cg == /user.slice/* ]]; then
+    printf '%s\tuser\n' "$seg"
+  else
+    printf '%s\tsystem\n' "$seg"
+  fi
+}
+
+collect_listeners() {
+  local rows=()
+  local line st rq sq local_addr peer rest port addr pid proc_name unit scope
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    read -r st rq sq local_addr peer rest <<<"$line"
+    [[ -n ${local_addr:-} ]] || continue
+    port="${local_addr##*:}"
+    is_safe_port "$port" || continue
+    # Ephemeral ports are usually internal plumbing (PipeWire, portals), not
+    # something a person pins.
+    ((10#$port >= 32768)) && continue
+    addr="${local_addr%:*}"
+    addr="${addr#[}"; addr="${addr%]}"; addr="${addr%%%*}"
+    pid=""
+    proc_name=""
+    if [[ ${rest:-} =~ pid=([0-9]+) ]]; then pid="${BASH_REMATCH[1]}"; fi
+    if [[ ${rest:-} =~ \"([^\"]+)\" ]]; then proc_name="${BASH_REMATCH[1]}"; fi
+    unit=""; scope=""
+    if [[ -n $pid ]]; then
+      IFS=$'\t' read -r unit scope <<<"$(unit_from_pid "$pid")"
+    fi
+    rows+=("$(jq -nc \
+      --arg addr "$addr" --argjson port "$((10#$port))" \
+      --arg process "$proc_name" --arg pid "$pid" \
+      --arg unit "$unit" --arg scope "$scope" \
+      '{addr:$addr, port:$port,
+        process:(if $process == "" then "" else $process end),
+        pid:$pid, unit:$unit, scope:$scope}')")
+  done < <(ss -ltnpH 2>/dev/null | head -n 200)
+  if ((${#rows[@]} == 0)); then
+    printf '[]\n'
+    return
+  fi
+  printf '%s\n' "${rows[@]}" |
+    jq -s 'unique_by(.addr + ":" + (.port|tostring) + ":" + .process) | sort_by(.port)'
+}
+
+collect_docker() {
+  local out rc reason=""
+  if ! command -v docker >/dev/null 2>&1; then
+    jq -nc '{available:false, reason:"docker not installed", containers:[]}'
+    return
+  fi
+  out=$(timeout 3 docker ps --format '{{json .}}' 2>&1)
+  rc=$?
+  if ((rc != 0)); then
+    reason=$(printf '%s' "$out" | head -c 200 | tr '\n' ' ')
+    jq -nc --arg reason "$reason" '{available:false, reason:$reason, containers:[]}'
+    return
+  fi
+  if [[ -z $out ]]; then
+    jq -nc '{available:true, reason:"", containers:[]}'
+    return
+  fi
+  printf '%s\n' "$out" | jq -s '{
+    available: true,
+    reason: "",
+    containers: [.[] | {
+      name: (.Names // ""),
+      image: (.Image // ""),
+      state: (.State // ""),
+      status: (.Status // ""),
+      ports: (.Ports // "")
+    }]
+  }'
+}
+
+cmd_local() {
+  local system_units user_units listeners docker warnings="[]"
+  system_units=$(systemctl list-units --type=service --all --output=json --no-pager 2>/dev/null)
+  [[ -n $system_units ]] || system_units='[]'
+  user_units=$(systemctl --user list-units --type=service --all --output=json --no-pager 2>/dev/null)
+  [[ -n $user_units ]] || user_units='[]'
+  printf '%s' "$system_units" | jq -e 'type == "array"' >/dev/null 2>&1 || system_units='[]'
+  printf '%s' "$user_units" | jq -e 'type == "array"' >/dev/null 2>&1 || user_units='[]'
+  listeners=$(collect_listeners)
+  docker=$(collect_docker)
+  jq -nc \
+    --argjson systemUnits "$system_units" \
+    --argjson userUnits "$user_units" \
+    --argjson listeners "$listeners" \
+    --argjson docker "$docker" \
+    --argjson warnings "$warnings" \
+    '{systemUnits:$systemUnits, userUnits:$userUnits, listeners:$listeners,
+      docker:$docker, warnings:$warnings}'
+}
+
+cmd_network() {
+  local records="" warnings=() arp_ips avahi_missing=0 tailscale_missing=0
+  local ip name port host svc_name source line
+  local -a probe_hosts=()
+  local -A advertised=()
+
+  command -v avahi-browse >/dev/null 2>&1 || avahi_missing=1
+  command -v tailscale >/dev/null 2>&1 || tailscale_missing=1
+
+  # 1. Neighbours already in the ARP table: zero packets.
+  while IFS= read -r ip; do
+    is_private_ip "$ip" || continue
+    records+=$(jq -nc --arg ip "$ip" '{kind:"host", ip:$ip, name:"", source:"arp"}')$'\n'
+    probe_hosts+=("$ip")
+  done < <(ip -j neigh 2>/dev/null |
+    jq -r '.[] | select((.state // "") | test("FAILED|INCOMPLETE") | not) | .dst' 2>/dev/null)
+
+  # 2. mDNS / DNS-SD: names and ports without touching every address.
+  if ((avahi_missing == 0)); then
+    while IFS=';' read -r tag iface proto name type domain host addr port txt; do
+      [[ ${tag:-} == "=" ]] || continue
+      is_useful_service_type "${type:-}" || continue
+      is_private_ip "${addr:-}" || continue
+      is_safe_port "${port:-}" || continue
+      name=$(avahi_unescape "$name")
+      host=$(avahi_unescape "$host")
+      records+=$(jq -nc --arg ip "$addr" --arg name "$host" \
+        '{kind:"host", ip:$ip, name:$name, source:"mdns"}')$'\n'
+      records+=$(jq -nc --arg ip "$addr" --argjson port "$((10#$port))" \
+        --arg name "$name" --arg type "$type" \
+        '{kind:"svc", ip:$ip, port:$port, name:$name, source:"mdns", type:$type}')$'\n'
+      advertised["$addr:$((10#$port))"]=1
+      case " ${probe_hosts[*]-} " in *" $addr "*) ;; *) probe_hosts+=("$addr") ;; esac
+    done < <(timeout 8 avahi-browse -artp 2>/dev/null | grep '^=;' || true)
+  else
+    warnings+=("avahi-browse is not installed; mDNS services are not listed")
+  fi
+
+  # 3. Tailnet peers: names, no port scan. Pinning one probes it explicitly.
+  if ((tailscale_missing == 0)); then
+    while IFS=$'\t' read -r ip name; do
+      [[ -n ${ip:-} ]] || continue
+      records+=$(jq -nc --arg ip "$ip" --arg name "$name" \
+        '{kind:"host", ip:$ip, name:$name, source:"tailscale"}')$'\n'
+      case " ${probe_hosts[*]-} " in *" $ip "*) ;; *) probe_hosts+=("$ip") ;; esac
+    done < <(timeout 3 tailscale status --json 2>/dev/null |
+      jq -r '[.Peer[]? | select(.Online == true)
+        | {ip: ([.TailscaleIPs[]? | select(test("^100\\."))][0]),
+           name: (.DNSName // .HostName // "")}]
+        | .[] | select(.ip != null)
+        | "\(.ip)\t\(.name | sub("\\.$"; ""))"' 2>/dev/null)
+  fi
+
+  # 4. Probe a short, fixed port list on already-discovered hosts only.
+  local -a pairs=()
+  local count=0
+  for ip in "${probe_hosts[@]}"; do
+    ((count++ >= NET_HOST_CAP)) && break
+    is_private_ip "$ip" || continue
+    for port in "${PROBE_PORTS[@]}"; do
+      [[ -n ${advertised["$ip:$port"]+x} ]] && continue
+      pairs+=("$ip $port")
+    done
+  done
+  if ((${#pairs[@]} > 0)); then
+    while read -r ip port; do
+      [[ -n ${ip:-} && -n ${port:-} ]] || continue
+      records+=$(jq -nc --arg ip "$ip" --argjson port "$port" \
+        '{kind:"svc", ip:$ip, port:$port, name:"", source:"probe"}')$'\n'
+    done < <(printf '%s\n' "${pairs[@]}" |
+      xargs -P 32 -n 2 bash -c 'timeout 0.3 bash -c '"'"'exec 3<>/dev/tcp/"$1"/"$2"'"'"' _ "$0" "$1" 2>/dev/null && printf "%s %s\n" "$0" "$1"' 2>/dev/null || true)
+  fi
+
+  local merged
+  merged=$(printf '%s' "$records" | jq -s '
+    reduce .[] as $r ({};
+      if $r.kind == "host" then
+        .[$r.ip] = (.[$r.ip] // {ip:$r.ip, name:"", sources:[], services:[]})
+        | .[$r.ip].sources = ((.[$r.ip].sources + [$r.source]) | unique)
+        | if (.[$r.ip].name == "" and $r.name != "") then .[$r.ip].name = $r.name else . end
+      elif $r.kind == "svc" then
+        .[$r.ip] = (.[$r.ip] // {ip:$r.ip, name:"", sources:[], services:[]})
+        | if ([.[$r.ip].services[] | select(.port == $r.port)] | length) == 0
+          then .[$r.ip].services += [{port:$r.port, name:($r.name // ""), source:($r.source // "probe")}]
+          else . end
+      else . end)
+    | [ .[] | select((.services | length) > 0) ]
+    | map(.services |= sort_by(.port))
+    | sort_by(.ip)
+  ' 2>/dev/null)
+  [[ -n $merged ]] || merged='[]'
+
+  local warnings_json
+  if ((${#warnings[@]})); then
+    warnings_json=$(printf '%s\n' "${warnings[@]}" | jq -R . | jq -s .)
+  else
+    warnings_json='[]'
+  fi
+
+  jq -nc --argjson hosts "$merged" --argjson warnings "$warnings_json" \
+    --argjson probed "${#pairs[@]}" \
+    '{hosts:$hosts, warnings:$warnings, probes:$probed, scannedAt:(now|floor)}'
+}
+
+cmd_probe_many() {
+  local lines=() host port key up
+  local out=""
+  # Arguments may be supplied as alternating host/port pairs so callers do not
+  # have to keep stdin open (Quickshell's Process has no close-stdin call).
+  if (($# > 0)); then
+    while (($# >= 2)); do
+      host="$1"
+      port="$2"
+      shift 2
+      is_safe_host "$host" && is_safe_port "$port" && lines+=("$host $port")
+    done
+  else
+    while read -r host port; do
+      is_safe_host "$host" && is_safe_port "$port" && lines+=("$host $port")
+    done
+  fi
+  if ((${#lines[@]} == 0)); then
+    printf '{}\n'
+    return
+  fi
+  # Cap the working set: the panel never needs more than this at once.
+  out=$(printf '%s\n' "${lines[@]:0:100}" |
+    xargs -P 16 -n 2 bash -c '
+      host="$0"; port="$1"
+      if timeout 0.6 bash -c '"'"'exec 3<>/dev/tcp/"$1"/"$2"'"'"' _ "$host" "$port" 2>/dev/null
+      then printf "%s %s true\n" "$host" "$port"
+      else printf "%s %s false\n" "$host" "$port"
+      fi' 2>/dev/null)
+  printf '%s\n' "$out" |
+    awk 'NF==3 {printf "{\"key\":\"%s:%s\",\"up\":%s}\n", $1, $2, $3}' |
+    jq -s 'map({(.key): .up}) | add // {}'
+}
+
+case "${1:-}" in
+local) cmd_local ;;
+network) cmd_network ;;
+probe-many)
+  shift || true
+  cmd_probe_many "$@"
+  ;;
+version) printf '{"version":"0.1.0"}\n' ;;
+*)
+  printf 'usage: collect.sh {local|network|probe-many|version}\n' >&2
+  exit 2
+  ;;
+esac
