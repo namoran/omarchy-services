@@ -98,7 +98,8 @@ Three entry types are supported:
 - `unit` — `scope` is `system` or `user`, `unit` must be a valid unit name.
   Optional `stopUnits` stops extra units first, e.g. `docker.socket`.
 - `container` — Docker container name.
-- `probe` — `host`, `port`, optional `scheme` (`http`/`https`) and `name`.
+- `probe` — `host`, `port`, optional `scheme` (`http`/`https`), `path`, and
+  `name`. `path` is used by the `open` button, e.g. `/admin/` for Pi-hole.
 
 The file is created with mode `0600` and rewritten atomically. It can contain
 private hostnames, so keep it out of version control. Malformed lines are

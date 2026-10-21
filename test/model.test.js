@@ -316,4 +316,20 @@ test("probe actions open web pages and ssh terminals", () => {
   assert.equal(Model.probeAction({ type: "probe", host: "-oProxyCommand=x", port: 22 }), null)
   assert.equal(Model.probeAction({ type: "probe", host: "2001:db8::10", port: 8080 }).url,
     "http://[2001:db8::10]:8080/")
+  assert.equal(
+    Model.probeAction({ type: "probe", host: "nas.local", port: 443, path: "/admin/" }).url,
+    "https://nas.local/admin/"
+  )
+  assert.equal(
+    Model.validateEntry({ type: "probe", host: "nas.local", port: 443, path: "/admin/" }),
+    ""
+  )
+  assert.equal(
+    Model.validateEntry({ type: "probe", host: "nas.local", port: 443, path: "/admin login" }),
+    "invalid path"
+  )
+  const roundTrip = Model.parseConfigText(Model.pinText(Model.HEADER, {
+    type: "probe", host: "nas.local", port: 443, scheme: "https", path: "/admin/", name: "Admin"
+  }))
+  assert.equal(roundTrip.entries[0].path, "/admin/")
 })
