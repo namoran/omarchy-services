@@ -202,6 +202,24 @@ test("network rows are pin-addressable and labelled by port when mDNS is silent"
   assert.equal(rows[0].pinnable, true)
 })
 
+test("Ollama on another host is labelled and openable", () => {
+  const network = {
+    hosts: [
+      { ip: "192.0.2.10", name: "desktop.tailnet.example", sources: ["tailscale"], services: [
+        { port: 11434, name: "", source: "probe" }
+      ] }
+    ]
+  }
+  const row = Model.networkRows(network, [])[0]
+  assert.equal(row.title, "Ollama")
+  assert.equal(row.id, "probe:desktop.tailnet.example:11434")
+  assert.deepEqual(row.action, {
+    kind: "open",
+    label: "open",
+    url: "http://desktop.tailnet.example:11434/"
+  })
+})
+
 test("Synology DSM, Web Station, and the 5000 redirect are labelled", () => {
   const network = {
     hosts: [{

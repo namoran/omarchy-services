@@ -117,7 +117,7 @@ A scan is one explicit action, never a background sweep:
    Home Assistant, Syncthing, ESPHome, workstations, and a few printers.
    AirPlay, Chromecast, and companion-link noise is ignored.
 3. Add online Tailscale peers.
-4. Probe 16 common ports on at most 32 hosts, 32 connects at a time, with a
+4. Probe 17 common ports on at most 32 hosts, 32 connects at a time, with a
    0.3 s timeout.
 5. Read response headers and short page titles from at most 16 of those open
    web ports. That is how an AirPlay receiver on 5000 becomes “AirPlay
