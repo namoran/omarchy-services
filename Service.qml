@@ -46,6 +46,13 @@ Item {
   property string actionMessage: ""
   property string actionError: ""
   property double lastProbeAt: 0
+  property string localHostname: ""
+  property bool mcpEnabled: false
+
+  // MCP gate: the marker file is the single switch for agent access. The MCP
+  // server re-checks it on every mutating call, so toggling here takes effect
+  // in already-running agent sessions.
+  readonly property string mcpGatePath: configDir + "/services-mcp-on"
 
   readonly property var pinnedEntries: {
     var out = []
@@ -109,7 +116,10 @@ Item {
     if (probeProc.running) return
     if (Date.now() - lastProbeAt < 5000) return
     lastProbeAt = Date.now()
-    probeProc.command = ["/usr/bin/env", "bash", helperPath, "probe-many"].concat(pairs.split(" "))
+    // Pairs are newline-joined "host port proto" triples; whitespace split
+    // keeps them token-per-argument for collect.sh.
+    var tokens = pairs.split(/\s+/).filter(function(token) { return token !== "" })
+    probeProc.command = ["/usr/bin/env", "bash", helperPath, "probe-many"].concat(tokens)
     probeProc.running = true
   }
 
@@ -131,6 +141,14 @@ Item {
         return
       }
       command = ["/usr/bin/docker", verb, entry.name]
+    } else if (entry.type === "remote") {
+      command = remoteCommand(entry, verb)
+      if (!command) {
+        actionError = "remote entry has an invalid host or script"
+        return
+      }
+      if (verb === "restart" && !localTarget(String(entry.host || "")))
+        actionMessage = "restart " + (entry.name || "") + " (a few seconds over ssh)"
     } else {
       return
     }
@@ -138,6 +156,31 @@ Item {
     actionMessage = verb + " " + (entry.name || entry.unit || "")
     actionProc.command = command
     actionProc.running = true
+  }
+
+  // Remote entries name a script on the target machine, never a command
+  // line. When the target is this machine the script runs directly;
+  // otherwise over ssh with a fixed argv, so nothing discovered or written
+  // into the config is ever interpolated into a shell string.
+  function localTarget(host) {
+    var value = String(host || "")
+    return value === localHostname || value === "localhost" ||
+      value === "127.0.0.1" || value === "::1"
+  }
+
+  function remoteCommand(entry, verb) {
+    var host = String(entry.host || "")
+    var script = String(entry.script || "")
+    var user = String(entry.user || "")
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(host)) return null
+    if (!/^\/[A-Za-z0-9._~%+/-]*$/.test(script) || script.length > 200) return null
+    if (user !== "" && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(user)) return null
+    if (localTarget(host)) return [script, verb]
+    var command = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+      "-o", "StrictHostKeyChecking=accept-new"]
+    command.push(user !== "" ? user + "@" + host : host)
+    command.push("--", script, verb)
+    return command
   }
 
   // Open actions come from Model.probeAction. Re-check here too: these values
@@ -170,6 +213,12 @@ Item {
     lastError = ""
     scanning = true
     scanProc.running = true
+  }
+
+  function setMcpEnabled(on) {
+    if (mcpToggleProc.running) return
+    mcpToggleProc.command = on ? ["/usr/bin/touch", mcpGatePath] : ["/usr/bin/rm", "-f", mcpGatePath]
+    mcpToggleProc.running = true
   }
 
   function applyLocal(raw) {
@@ -216,6 +265,19 @@ Item {
     onLoadFailed: services.ensureConfig()
   }
 
+  FileView {
+    id: mcpGateFile
+    path: services.mcpGatePath
+    watchChanges: true
+    printErrors: false
+    onLoaded: services.mcpEnabled = true
+    onLoadFailed: services.mcpEnabled = false
+  }
+
+  Process {
+    id: mcpToggleProc
+  }
+
   Process {
     id: initProc
     command: ["/usr/bin/mkdir", "-p", services.configDir]
@@ -224,6 +286,19 @@ Item {
       services.applyConfig(Model.HEADER)
       services.tightenPermissions()
     }
+  }
+
+  Process {
+    id: hostnameProc
+    command: ["/usr/bin/cat", "/proc/sys/kernel/hostname"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: services.localHostname = text.trim()
+    }
+  }
+
+  Component.onCompleted: {
+    hostnameProc.running = true
   }
 
   Timer {

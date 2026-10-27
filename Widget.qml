@@ -42,7 +42,7 @@ Panel {
   }
 
   function canRestart(kind, state) {
-    return (kind === "unit" || kind === "container") && state === "active"
+    return (kind === "unit" || kind === "container" || kind === "remote") && state === "active"
   }
 
   function actionVerbFor(state) {
@@ -52,7 +52,9 @@ Panel {
   }
 
   function rowState(row) {
-    var probeKey = row.kind === "network" ? String(row.host) + ":" + row.port : ""
+    var probeKey = row.kind === "network"
+      ? (row.proto === "udp" ? "udp:" : "") + String(row.host) + ":" + row.port
+      : ""
     if (row.state !== undefined) return row.state
     if (row.kind === "network") {
       if (row.pinned && services.probes[probeKey] === true) return "active"
@@ -355,7 +357,7 @@ Panel {
               stateLabel: modelData.stateLabel
               pinned: true
               alert: root.isIssueState(modelData.state)
-              showAction: modelData.kind === "unit" || modelData.kind === "container"
+              showAction: modelData.kind === "unit" || modelData.kind === "container" || modelData.kind === "remote"
               actionVerb: root.actionVerbFor(modelData.state)
               actionEnabled: !services.acting
               showRestart: root.canRestart(modelData.kind, modelData.state)
@@ -506,6 +508,32 @@ Panel {
               openLabel: modelData.action ? modelData.action.label : ""
               onPinClicked: root.togglePin(modelData)
               onOpenClicked: services.runOpen(modelData.action)
+            }
+          }
+
+          // Agent access ----------------------------------------------------
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+
+            TabChip {
+              id: mcpChip
+              label: services.mcpEnabled ? "Agent access: on" : "Agent access: off"
+              selected: services.mcpEnabled
+              showCount: false
+              onClicked: services.setMcpEnabled(!services.mcpEnabled)
+            }
+
+            Text {
+              width: parent.width - mcpChip.width - parent.spacing
+              text: services.mcpEnabled
+                ? "Agents on this machine can start and stop pinned services."
+                : "Agents can only look. Switch on to let them act on pinned services."
+              color: root.dim
+              wrapMode: Text.Wrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              topPadding: Style.space(4)
             }
           }
 

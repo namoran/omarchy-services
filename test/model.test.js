@@ -171,13 +171,14 @@ test("entry state comes from the matching scope only", () => {
   assert.equal(Model.entryState({ type: "probe", id: "probe:nas:2", host: "nas", port: 2 }, ctx).state, "unknown")
 })
 
-test("probe pairs are only built for pinned probes", () => {
+test("probe pairs are only built for pinned probes and carry their proto", () => {
   const entries = [
     Object.assign({ type: "probe", host: "nas", port: 8096, pinned: true }, { id: "probe:nas:8096" }),
+    Object.assign({ type: "probe", host: "box", port: 19132, proto: "udp", pinned: true }, { id: "probe:box:19132:udp" }),
     Object.assign({ type: "unit", scope: "system", unit: "docker.service", pinned: true }, { id: "unit:system:docker.service" }),
     Object.assign({ type: "probe", host: "nas", port: 80, pinned: false }, { id: "probe:nas:80" })
   ]
-  assert.equal(Model.probePairs(entries), "nas 8096")
+  assert.equal(Model.probePairs(entries), "nas 8096 tcp\nbox 19132 udp")
   assert.deepEqual(Model.parseProbeJson('{"nas:8096":true}'), { "nas:8096": true })
   assert.deepEqual(Model.parseProbeJson("nope"), {})
 })
@@ -350,4 +351,128 @@ test("probe actions open web pages and ssh terminals", () => {
     type: "probe", host: "nas.local", port: 443, scheme: "https", path: "/admin/", name: "Admin"
   }))
   assert.equal(roundTrip.entries[0].path, "/admin/")
+})
+
+test("udp probe entries are validated, ided, and probed in their own namespace", () => {
+  assert.equal(Model.validateEntry({ type: "probe", host: "box", port: 19132, proto: "udp" }), "")
+  assert.equal(Model.validateEntry({ type: "probe", host: "box", port: 19132, proto: "sctp" }), "invalid proto")
+  assert.equal(Model.entryId({ type: "probe", host: "box", port: 19132, proto: "udp" }), "probe:box:19132:udp")
+  assert.equal(Model.entryId({ type: "probe", host: "box", port: 19132 }), "probe:box:19132")
+
+  const ctx = { probes: { "udp:box:19132": true, "box:80": false } }
+  assert.equal(Model.entryState({ type: "probe", host: "box", port: 19132, proto: "udp" }, ctx).state, "active")
+  assert.equal(Model.entryState({ type: "probe", host: "box", port: 80 }, ctx).state, "inactive")
+
+  const pinned = Model.pinText(Model.HEADER, { type: "probe", host: "box", port: 19132, proto: "udp", name: "Bedrock" })
+  const parsed = Model.parseConfigText(pinned)
+  assert.equal(parsed.entries[0].proto, "udp")
+  assert.equal(Model.probePairs(parsed.entries), "box 19132 udp")
+})
+
+test("nethernet bedrock (tcp signalling) is labelled with level and players", () => {
+  const network = {
+    hosts: [{
+      ip: "192.0.2.30", name: "desktop.example", sources: ["tailscale"], services: [
+        { port: 19132, name: "", source: "probe",
+          title: "MoranFamily", level: "Bedrock level", players: 0, maxPlayers: 10 }
+      ]
+    }]
+  }
+  const rows = Model.networkRows(network, [])
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].id, "probe:desktop.example:19132")
+  assert.equal(rows[0].title, "MoranFamily")
+  assert.match(rows[0].subtitle, /NetherNet/)
+  assert.match(rows[0].subtitle, /0\/10 players/)
+  assert.equal(rows[0].entry.proto, undefined)
+
+  // Plain tcp 19132 without any join-endpoint data stays a generic port row.
+  const plain = Model.networkRows({ hosts: [{ ip: "192.0.2.31", name: "box.example", sources: [], services: [
+    { port: 19132, name: "", source: "probe" }
+  ] }] }, [])
+  assert.equal(plain[0].title, "Minecraft Bedrock")
+  assert.equal(plain[0].subtitle.indexOf("NetherNet"), -1)
+})
+
+test("remote entries validate host, user, script, and probe fields", () => {
+  const good = {
+    type: "remote", host: "desktop.example", user: "nam",
+    script: "/opt/bedrock/minecraft-bedrock-server-ctl",
+    name: "Minecraft Bedrock", probePort: 19132, probeProto: "udp"
+  }
+  assert.equal(Model.validateEntry(good), "")
+  assert.equal(Model.validateEntry(Object.assign({}, good, { user: undefined })), "")
+  assert.equal(Model.validateEntry(Object.assign({}, good, { probePort: undefined, probeProto: undefined })), "")
+  assert.notEqual(Model.validateEntry(Object.assign({}, good, { host: "" })), "")
+  assert.notEqual(Model.validateEntry(Object.assign({}, good, { host: "-oProxyCommand=x" })), "")
+  assert.notEqual(Model.validateEntry(Object.assign({}, good, { user: "-l" })), "")
+  assert.notEqual(Model.validateEntry(Object.assign({}, good, { script: "bedrock-ctl" })), "relative script path")
+  assert.notEqual(Model.validateEntry(Object.assign({}, good, { script: "/etc/x; reboot" })), "shell metacharacters")
+  assert.notEqual(Model.validateEntry(Object.assign({}, good, { probeProto: "icmp" })), "")
+  assert.notEqual(Model.validateEntry(Object.assign({}, good, { probePort: 0 })), "")
+
+  assert.equal(Model.entryId(good), "remote:desktop.example:minecraft-bedrock-server-ctl")
+
+  const parsed = Model.parseConfigText(Model.pinText(Model.HEADER, good))
+  const entry = parsed.entries[0]
+  assert.equal(entry.type, "remote")
+  assert.equal(entry.user, "nam")
+  assert.equal(entry.probePort, 19132)
+  assert.equal(entry.probeProto, "udp")
+  assert.equal(Model.probePairs(parsed.entries), "desktop.example 19132 udp")
+})
+
+test("remote entry state and summary use the udp probe namespace", () => {
+  const entry = {
+    type: "remote", host: "desktop", script: "/opt/bedrock/bedrock-ctl",
+    name: "Minecraft Bedrock", probePort: 19132, probeProto: "udp",
+    id: "remote:desktop:bedrock-ctl", pinned: true
+  }
+  const up = { probes: { "udp:desktop:19132": true } }
+  const down = { probes: { "udp:desktop:19132": false } }
+  const pending = { probes: {} }
+  assert.equal(Model.entryState(entry, up).state, "active")
+  assert.equal(Model.entryState(entry, down).state, "inactive")
+  assert.equal(Model.entryState(entry, pending).label, "checking…")
+  assert.equal(Model.entryState(Object.assign({}, entry, { probePort: undefined }), up).label, "no probe")
+
+  const rows = Model.pinnedRows([entry], down)
+  assert.equal(rows[0].title, "Minecraft Bedrock")
+  assert.match(rows[0].subtitle, /^remote · desktop$/)
+  assert.deepEqual(Model.summary([entry], down), { total: 1, running: 0, issues: 1 })
+  assert.deepEqual(Model.summary([entry], up), { total: 1, running: 1, issues: 0 })
+})
+
+test("minecraft services are labelled with MOTD and player counts", () => {
+  assert.equal(Model.portLabel(19132), "Minecraft Bedrock")
+  assert.equal(Model.portLabel(25565), "Minecraft Java")
+
+  const network = {
+    hosts: [{
+      ip: "192.0.2.30", name: "desktop.example", sources: ["tailscale"], services: [
+        { port: 19132, name: "", source: "probe", proto: "udp",
+          title: "MoranFamily", players: 2, maxPlayers: 8 },
+        { port: 25565, name: "", source: "probe" }
+      ]
+    }]
+  }
+  const rows = Model.networkRows(network, [])
+  const bedrock = rows.find((row) => row.port === 19132)
+  const java = rows.find((row) => row.port === 25565)
+  assert.equal(bedrock.id, "probe:desktop.example:19132:udp")
+  assert.equal(bedrock.title, "MoranFamily")
+  assert.match(bedrock.subtitle, /UDP/)
+  assert.match(bedrock.subtitle, /2\/8 players/)
+  assert.equal(bedrock.entry.proto, "udp")
+  assert.equal(bedrock.action, null, "no web UI to open for Bedrock")
+  assert.equal(bedrock.pinnable, true)
+  assert.equal(java.title, "Minecraft Java")
+  assert.equal(java.action, null)
+  assert.equal(java.entry.proto, undefined)
+
+  // Pinning a discovered bedrock row round-trips as a udp probe entry.
+  const parsed = Model.parseConfigText(Model.pinText(Model.HEADER, bedrock.entry))
+  assert.equal(parsed.entries[0].type, "probe")
+  assert.equal(parsed.entries[0].proto, "udp")
+  assert.equal(parsed.entries[0].id, "probe:desktop.example:19132:udp")
 })

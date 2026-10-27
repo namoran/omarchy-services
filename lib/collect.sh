@@ -6,7 +6,9 @@
 #
 #   collect.sh local        units, listeners, containers on this machine
 #   collect.sh network      neighbours, mDNS services, tailnet peers, probes
-#   collect.sh probe-many   reachability for "host port" pairs on stdin
+#   collect.sh probe-many   reachability for "host port proto" triples
+#   collect.sh ping-mc      one RakNet ping: "host port true|false"
+#   collect.sh mc-info      Bedrock MOTD and player counts for one host:port
 #
 # The output of every command is a single JSON object. Diagnostics go to
 # stderr; a failure never produces half a document.
@@ -17,7 +19,12 @@ export LC_ALL=C
 
 PROBE_TIMEOUT="0.30"
 NET_HOST_CAP=32
-PROBE_PORTS=(22 53 80 443 3000 5000 5001 631 8000 8080 8096 8123 8443 9090 11434 19999 32400)
+PROBE_PORTS=(22 53 80 443 3000 5000 5001 631 8000 8080 8096 8123 8443 9090 11434 19132 25565 19999 32400)
+# TCP 19132 is the NetherNet signalling socket (BDS 26.50+); RakNet-era
+# servers are UDP-only there, so the connect just fails. UDP 19132 answers
+# the RakNet ping on older servers.
+UDP_PORTS=(19132)
+RAKNET_TIMEOUT="0.60"
 # Only these open ports get an HTTP fingerprint. Kept small so a scan stays
 # interactive even when several hosts hang instead of answering.
 HTTP_PORTS=(80 443 3000 5000 5001 8000 8080 8096 8123 8443 9000 9090 19999 32400)
@@ -94,6 +101,79 @@ is_safe_port() {
 probe_port() {
   local host="$1" port="$2"
   timeout "$PROBE_TIMEOUT" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null
+}
+
+# RakNet unconnected ping: the packet every Minecraft Bedrock server answers,
+# and the only reliable UDP question here. Pure bash: /dev/udp needs no extra
+# tools. The ping is ID_UNCONNECTED_PING + timestamp + magic + guid; the reply
+# is 0x1c + echoed timestamp + magic + guid + a string carrying MOTD, version,
+# and player counts.
+raknet_packet() {
+  printf '\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78\x12\x34\x56\x78\x00\x00\x00\x00'
+}
+
+raknet_ping() {
+  local host="$1" port="$2" reply=""
+  exec 3<>/dev/udp/"$host"/"$port" 2>/dev/null || return 1
+  raknet_packet >&3 2>/dev/null || { exec 3>&- 3<&-; return 1; }
+  # -N waits for 2048 bytes that never come, so this always burns the full
+  # timeout — but bash keeps partial input in the variable on timeout, which
+  # is exactly the one datagram we need. A one-byte read would return sooner
+  # and throw the rest of the datagram away.
+  IFS= read -r -t "$RAKNET_TIMEOUT" -N 2048 reply <&3 || true
+  exec 3>&- 3<&-
+  # A real reply starts with ID_UNCONNECTED_PING_OPEN_CONNECTIONS_REPLY (0x1c).
+  [[ -n $reply && ${reply:0:1} == $'\x1c' ]] || return 1
+  return 0
+}
+
+# Prints "host port true|false" per pair, the same line format the TCP probe
+# loop produces, so callers can treat both uniformly.
+cmd_ping_mc() {
+  local host="${1:-}" port="${2:-}" up=false
+  is_safe_host "$host" && is_safe_port "$port" || return 0
+  raknet_ping "$host" "$port" && up=true
+  printf '%s %s %s\n' "$host" "$port" "$up"
+}
+
+# Prints "ip<US>port<US>motd<US>players<US>max" for a live Bedrock server.
+# Unit separators, not tabs: bash IFS collapsing would drop empty fields.
+cmd_mc_info() {
+  local ip="${1:-}" port="${2:-}" reply="" payload motd players max
+  is_safe_host "$ip" || return 0
+  is_safe_port "$port" || return 0
+  [[ $ip == *:* ]] && return 0
+  exec 3<>/dev/udp/"$ip"/"$port" 2>/dev/null || return 0
+  raknet_packet >&3 2>/dev/null || { exec 3>&- 3<&-; return 0; }
+  IFS= read -r -t "$RAKNET_TIMEOUT" -N 2048 reply <&3 || true
+  exec 3>&- 3<&-
+  [[ -n $reply && ${reply:0:1} == $'\x1c' ]] || return 0
+  # 0x1c + 8-byte timestamp + 16-byte magic + 8-byte guid + 2-byte length.
+  payload="${reply:35}"
+  IFS=';' read -r _ motd _ _ players max <<<"$payload"
+  motd=$(printf '%s' "${motd:-}" | tr -d '\r' | cut -c1-120)
+  players=$(printf '%s' "${players:-}" | tr -cd '0-9')
+  max=$(printf '%s' "${max:-}" | tr -cd '0-9')
+  [[ -n $motd ]] || return 0
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$ip" "$port" "$motd" "${players:-0}" "${max:-0}"
+}
+
+# NetherNet (BDS 26.50+) answers the same join request real clients make:
+# GET /v1/join on server-port, HTTP over TCP, JSON body. Prints
+# "ip<US>port<US>name<US>level<US>players<US>max".
+cmd_nether_info() {
+  local ip="${1:-}" port="${2:-}" response name level players max
+  is_safe_host "$ip" || return 0
+  is_safe_port "$port" || return 0
+  [[ $ip == *:* ]] && return 0
+  response=$(curl -ksS -m 2 --max-filesize 20000 "http://$ip:$port/v1/join" 2>/dev/null)
+  [[ -n $response ]] || return 0
+  name=$(printf '%s' "$response" | jq -r '.name // empty' 2>/dev/null | cut -c1-120)
+  [[ -n $name ]] || return 0
+  level=$(printf '%s' "$response" | jq -r '.level // empty' 2>/dev/null | cut -c1-120)
+  players=$(printf '%s' "$response" | jq -r '.players // 0' 2>/dev/null | tr -cd '0-9')
+  max=$(printf '%s' "$response" | jq -r '.maxPlayers // 0' 2>/dev/null | tr -cd '0-9')
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$ip" "$port" "$name" "$level" "${players:-0}" "${max:-0}"
 }
 
 unit_from_pid() {
@@ -251,7 +331,7 @@ cmd_network() {
   fi
 
   # 4. Probe a short, fixed port list on already-discovered hosts only.
-  local -a pairs=()
+  local -a pairs=() udp_pairs=()
   local count=0
   for ip in "${probe_hosts[@]}"; do
     ((count++ >= NET_HOST_CAP)) && break
@@ -260,8 +340,11 @@ cmd_network() {
       [[ -n ${advertised["$ip:$port"]+x} ]] && continue
       pairs+=("$ip $port")
     done
+    for port in "${UDP_PORTS[@]}"; do
+      udp_pairs+=("$ip $port")
+    done
   done
-  local -a opened=()
+  local -a opened=() udp_opened=()
   if ((${#pairs[@]} > 0)); then
     local open_out
     open_out=$(printf '%s\n' "${pairs[@]}" |
@@ -272,6 +355,17 @@ cmd_network() {
         '{kind:"svc", ip:$ip, port:$port, name:"", source:"probe"}')$'\n'
       opened+=("$ip $port")
     done <<<"$open_out"
+  fi
+  if ((${#udp_pairs[@]} > 0)); then
+    local udp_out
+    udp_out=$(printf '%s\n' "${udp_pairs[@]}" |
+      xargs -P 16 -n 2 bash "$SELF" ping-mc 2>/dev/null || true)
+    while IFS=' ' read -r ip port up; do
+      [[ -n ${ip:-} && -n ${port:-} && $up == true ]] || continue
+      records+=$(jq -nc --arg ip "$ip" --argjson port "$port" \
+        '{kind:"svc", ip:$ip, port:$port, name:"", source:"probe", proto:"udp"}')$'\n'
+      udp_opened+=("$ip $port")
+    done <<<"$udp_out"
   fi
 
   # 5. Ask open web-ish ports who they are. This is what distinguishes an
@@ -295,6 +389,40 @@ cmd_network() {
       xargs -P 8 -n 2 bash "$SELF" fingerprint 2>/dev/null)
   fi
 
+  # 5b. Ask live Bedrock pings who they are. The MOTD becomes the row title
+  # and the player counts reach the subtitle.
+  if ((${#udp_opened[@]} > 0)); then
+    local -a mc_pairs=("${udp_opened[@]:0:16}")
+    while IFS=$'\x1f' read -r ip port motd players max; do
+      [[ -n ${ip:-} && -n ${port:-} ]] || continue
+      records+=$(jq -nc --arg ip "$ip" --argjson port "$port" \
+        --arg title "${motd:-}" --argjson players "${players:-0}" --argjson max "${max:-0}" \
+        '{kind:"mcinfo", ip:$ip, port:$port, title:$title,
+          players:$players, maxPlayers:$max}')$'\n'
+    done < <(printf '%s\n' "${mc_pairs[@]}" |
+      xargs -P 8 -n 2 bash "$SELF" mc-info 2>/dev/null)
+  fi
+
+  # 5c. Ask open TCP 19132 ports (NetherNet signalling, BDS 26.50+) who they
+  # are via the same /v1/join request real clients make.
+  local -a nether_pairs=()
+  for entry in "${opened[@]}"; do
+    read -r ip port <<<"$entry"
+    [[ $port == 19132 ]] || continue
+    nether_pairs+=("$ip $port")
+  done
+  if ((${#nether_pairs[@]} > 0)); then
+    while IFS=$'\x1f' read -r ip port name level players max; do
+      [[ -n ${ip:-} && -n ${port:-} ]] || continue
+      records+=$(jq -nc --arg ip "$ip" --argjson port "$port" \
+        --arg title "${name:-}" --arg level "${level:-}" \
+        --argjson players "${players:-0}" --argjson max "${max:-0}" \
+        '{kind:"mcinfo", ip:$ip, port:$port, title:$title, level:$level,
+          players:$players, maxPlayers:$max}')$'\n'
+    done < <(printf '%s\n' "${nether_pairs[@]}" |
+      xargs -P 8 -n 2 bash "$SELF" nether-info 2>/dev/null)
+  fi
+
   local merged
   merged=$(printf '%s' "$records" | jq -s '
     reduce .[] as $r ({};
@@ -305,12 +433,16 @@ cmd_network() {
       elif $r.kind == "svc" then
         .[$r.ip] = (.[$r.ip] // {ip:$r.ip, name:"", sources:[], services:[]})
         | if ([.[$r.ip].services[] | select(.port == $r.port)] | length) == 0
-          then .[$r.ip].services += [{port:$r.port, name:($r.name // ""), source:($r.source // "probe")}]
+          then .[$r.ip].services += [{port:$r.port, name:($r.name // ""), source:($r.source // "probe"), proto:($r.proto // "tcp")}]
           else . end
       elif $r.kind == "fingerprint" then
         .[$r.ip] = (.[$r.ip] // {ip:$r.ip, name:"", sources:[], services:[]})
         | .[$r.ip].services = ([.[$r.ip].services[]
             | if .port == $r.port then . + {server:$r.server, title:$r.title, synology:$r.synology} else . end])
+      elif $r.kind == "mcinfo" then
+        .[$r.ip] = (.[$r.ip] // {ip:$r.ip, name:"", sources:[], services:[]})
+        | .[$r.ip].services = ([.[$r.ip].services[]
+            | if .port == $r.port then . + {title:$r.title, level:($r.level // ""), players:$r.players, maxPlayers:$r.maxPlayers} else . end])
       else . end)
     | [ .[] | select((.services | length) > 0) ]
     | map(.services |= sort_by(.port))
@@ -360,20 +492,29 @@ cmd_fingerprint() {
 }
 
 cmd_probe_many() {
-  local lines=() host port key up
+  local lines=() host port proto key up
   local out=""
-  # Arguments may be supplied as alternating host/port pairs so callers do not
+  # Arguments may be supplied as "host port proto" triples so callers do not
   # have to keep stdin open (Quickshell's Process has no close-stdin call).
+  # Two-token legacy pairs are treated as tcp.
   if (($# > 0)); then
-    while (($# >= 2)); do
+    while (($# >= 3)); do
       host="$1"
       port="$2"
-      shift 2
-      is_safe_host "$host" && is_safe_port "$port" && lines+=("$host $port")
+      proto="$3"
+      shift 3
+      [[ $proto == tcp || $proto == udp ]] || continue
+      is_safe_host "$host" && is_safe_port "$port" && lines+=("$host $port $proto")
     done
+    if (($# >= 2)); then
+      host="$1"
+      port="$2"
+      is_safe_host "$host" && is_safe_port "$port" && lines+=("$host $port tcp")
+    fi
   else
-    while read -r host port; do
-      is_safe_host "$host" && is_safe_port "$port" && lines+=("$host $port")
+    while read -r host port proto; do
+      [[ $proto == tcp || $proto == udp ]] || proto=tcp
+      is_safe_host "$host" && is_safe_port "$port" && lines+=("$host $port $proto")
     done
   fi
   if ((${#lines[@]} == 0)); then
@@ -381,13 +522,32 @@ cmd_probe_many() {
     return
   fi
   # Cap the working set: the panel never needs more than this at once.
-  out=$(printf '%s\n' "${lines[@]:0:100}" |
-    xargs -P 16 -n 2 bash -c '
-      host="$0"; port="$1"
-      if timeout 0.6 bash -c '"'"'exec 3<>/dev/tcp/"$1"/"$2"'"'"' _ "$host" "$port" 2>/dev/null
-      then printf "%s %s true\n" "$host" "$port"
-      else printf "%s %s false\n" "$host" "$port"
-      fi' 2>/dev/null)
+  local -a tcp_pairs=() udp_pairs=()
+  local item
+  for item in "${lines[@]:0:100}"; do
+    read -r host port proto <<<"$item"
+    if [[ $proto == udp ]]; then
+      udp_pairs+=("$host $port")
+    else
+      tcp_pairs+=("$host $port")
+    fi
+  done
+  out=""
+  if ((${#tcp_pairs[@]} > 0)); then
+    out=$(printf '%s\n' "${tcp_pairs[@]}" |
+      xargs -P 16 -n 2 bash -c '
+        host="$0"; port="$1"
+        if timeout 0.6 bash -c '"'"'exec 3<>/dev/tcp/"$1"/"$2"'"'"' _ "$host" "$port" 2>/dev/null
+        then printf "%s %s true\n" "$host" "$port"
+        else printf "%s %s false\n" "$host" "$port"
+        fi' 2>/dev/null)
+  fi
+  if ((${#udp_pairs[@]} > 0)); then
+    while IFS=' ' read -r host port up; do
+      [[ -n ${host:-} && -n ${port:-} && -n ${up:-} ]] || continue
+      out+="udp:$host $port $up"$'\n'
+    done < <(printf '%s\n' "${udp_pairs[@]}" | xargs -P 16 -n 2 bash "$SELF" ping-mc 2>/dev/null)
+  fi
   printf '%s\n' "$out" |
     awk 'NF==3 {printf "{\"key\":\"%s:%s\",\"up\":%s}\n", $1, $2, $3}' |
     jq -s 'map({(.key): .up}) | add // {}'
@@ -404,9 +564,21 @@ fingerprint)
   shift || true
   cmd_fingerprint "$@"
   ;;
-version) printf '{"version":"0.3.0"}\n' ;;
+ping-mc)
+  shift || true
+  cmd_ping_mc "$@"
+  ;;
+mc-info)
+  shift || true
+  cmd_mc_info "$@"
+  ;;
+nether-info)
+  shift || true
+  cmd_nether_info "$@"
+  ;;
+version) printf '{"version":"0.5.0"}\n' ;;
 *)
-  printf 'usage: collect.sh {local|network|probe-many|fingerprint|version}\n' >&2
+  printf 'usage: collect.sh {local|network|probe-many|fingerprint|ping-mc|mc-info|nether-info|version}\n' >&2
   exit 2
   ;;
 esac
