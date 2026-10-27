@@ -216,7 +216,7 @@ Item {
   }
 
   function setMcpEnabled(on) {
-    if (mcpToggleProc.running) return
+    if (mcpToggleProc.running || mcpGateCheck.running) return
     mcpToggleProc.command = on ? ["/usr/bin/touch", mcpGatePath] : ["/usr/bin/rm", "-f", mcpGatePath]
     mcpToggleProc.running = true
   }
@@ -274,8 +274,18 @@ Item {
     onLoadFailed: services.mcpEnabled = false
   }
 
+  // The FileView notices the gate being created, but deletion is the flaky
+  // direction. Every toggle therefore ends with an explicit existence test,
+  // so the chip always reflects what is actually on disk.
   Process {
     id: mcpToggleProc
+    onExited: mcpGateCheck.running = true
+  }
+
+  Process {
+    id: mcpGateCheck
+    command: ["/usr/bin/test", "-e", services.mcpGatePath]
+    onExited: services.mcpEnabled = (mcpGateCheck.exitCode === 0)
   }
 
   Process {
