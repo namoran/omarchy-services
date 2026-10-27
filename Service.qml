@@ -265,18 +265,11 @@ Item {
     onLoadFailed: services.ensureConfig()
   }
 
-  FileView {
-    id: mcpGateFile
-    path: services.mcpGatePath
-    watchChanges: true
-    printErrors: false
-    onLoaded: services.mcpEnabled = true
-    onLoadFailed: services.mcpEnabled = false
-  }
-
-  // The FileView notices the gate being created, but deletion is the flaky
-  // direction. Every toggle therefore ends with an explicit existence test,
-  // so the chip always reflects what is actually on disk.
+  // The gate file is the single switch for agent access (the MCP server
+  // re-reads it on every mutating call). Quickshell's FileView cannot watch
+  // a file into existence or notice its deletion — verified empirically —
+  // so the chip polls the filesystem instead: a 5 s existence test keeps it
+  // truthful, and toggles also check immediately.
   Process {
     id: mcpToggleProc
     onExited: mcpGateCheck.running = true
@@ -285,7 +278,24 @@ Item {
   Process {
     id: mcpGateCheck
     command: ["/usr/bin/test", "-e", services.mcpGatePath]
-    onExited: services.mcpEnabled = (mcpGateCheck.exitCode === 0)
+    onExited: function(exitCode) { services.mcpEnabled = (exitCode === 0) }
+  }
+
+  Timer {
+    id: bootCheck
+    interval: 150
+    running: true
+    onTriggered: mcpGateCheck.running = true
+  }
+
+  Timer {
+    interval: 5000
+    running: true
+    repeat: true
+    onTriggered: {
+      if (!mcpToggleProc.running && !mcpGateCheck.running)
+        mcpGateCheck.running = true
+    }
   }
 
   Process {

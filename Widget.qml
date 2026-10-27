@@ -147,6 +147,7 @@ Panel {
         summary: services.summary,
         pinned: services.pinnedEntries.map(function(entry) { return entry.id }),
         probes: services.probes,
+        mcpEnabled: services.mcpEnabled,
         loading: services.loading,
         error: services.lastError
       })
