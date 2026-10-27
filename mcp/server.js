@@ -303,7 +303,13 @@ async function callTool(name, args) {
 
 function textResult(payload, isError) {
   const body = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2)
-  return { content: [{ type: "text", text: body }], isError: Boolean(isError) }
+  // structuredContent alongside the text: clients that want objects (Code
+  // Mode bridges, SDKs) read this instead of re-parsing the text blob.
+  return {
+    content: [{ type: "text", text: body }],
+    isError: Boolean(isError),
+    structuredContent: typeof payload === "string" ? null : payload
+  }
 }
 
 function respond(id, result) {
@@ -337,7 +343,7 @@ async function handleMessage(message) {
     const args = (message.params && message.params.arguments) || {}
     try {
       const payload = await callTool(name, args)
-      respond(message.id, payload)
+      respond(message.id, textResult(payload, Boolean(payload && payload.isError)))
     } catch (error) {
       respond(message.id, textResult(String(error && error.message || error), true))
     }
