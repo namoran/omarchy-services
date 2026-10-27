@@ -473,6 +473,29 @@ test("pinned minecraft probes surface player counts from probe-many info", () =>
   assert.match(remoteRows[0].subtitle, /0\/10 players/)
 })
 
+test("a pinned remote entry dedupes its network row", () => {
+  const remote = {
+    id: "remote:desktop.example:minecraft-bedrock-server-ctl",
+    type: "remote", host: "desktop.example", user: "nam",
+    script: "/opt/bedrock/minecraft-bedrock-server-ctl",
+    name: "Minecraft Bedrock", probePort: 19132, probeProto: "tcp", pinned: true
+  }
+  const network = { hosts: [{ ip: "192.0.2.30", name: "desktop.example", sources: ["tailscale"], services: [
+    { port: 19132, name: "", source: "probe", title: "MoranFamily", players: 0, maxPlayers: 10 }
+  ] }] }
+  const rows = Model.networkRows(network, [remote])
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].id, "remote:desktop.example:minecraft-bedrock-server-ctl")
+  assert.equal(rows[0].pinned, true, "star shows filled via the remote entry")
+
+  // A different host:port is not covered.
+  const other = Model.networkRows({ hosts: [{ ip: "192.0.2.31", name: "box.example", sources: [], services: [
+    { port: 19132, name: "", source: "probe" }
+  ] }] }, [remote])
+  assert.equal(other[0].id, "probe:box.example:19132")
+  assert.equal(other[0].pinned, false)
+})
+
 test("minecraft services are labelled with MOTD and player counts", () => {
   assert.equal(Model.portLabel(19132), "Minecraft Bedrock")
   assert.equal(Model.portLabel(25565), "Minecraft Java")
