@@ -492,7 +492,7 @@ cmd_fingerprint() {
 }
 
 cmd_probe_many() {
-  local lines=() host port proto key up
+  local lines=() host port proto key up info_jobs=()
   local out=""
   # Arguments may be supplied as "host port proto" triples so callers do not
   # have to keep stdin open (Quickshell's Process has no close-stdin call).
@@ -534,23 +534,63 @@ cmd_probe_many() {
   done
   out=""
   if ((${#tcp_pairs[@]} > 0)); then
-    out=$(printf '%s\n' "${tcp_pairs[@]}" |
+    local tcp_out line h p up
+    tcp_out=$(printf '%s\n' "${tcp_pairs[@]}" |
       xargs -P 16 -n 2 bash -c '
         host="$0"; port="$1"
         if timeout 0.6 bash -c '"'"'exec 3<>/dev/tcp/"$1"/"$2"'"'"' _ "$host" "$port" 2>/dev/null
         then printf "%s %s true\n" "$host" "$port"
         else printf "%s %s false\n" "$host" "$port"
         fi' 2>/dev/null)
+    while IFS= read -r line; do
+      [[ -n ${line:-} ]] || continue
+      out+="$line"$'\n'
+      read -r h p up <<<"$line"
+      [[ $up == true && $p == 19132 ]] && info_jobs+=("tcp $h $p")
+    done <<<"$tcp_out"
   fi
   if ((${#udp_pairs[@]} > 0)); then
-    while IFS=' ' read -r host port up; do
-      [[ -n ${host:-} && -n ${port:-} && -n ${up:-} ]] || continue
-      out+="udp:$host $port $up"$'\n'
+    while IFS=' ' read -r h p up; do
+      [[ -n ${h:-} && -n ${p:-} && -n ${up:-} ]] || continue
+      out+="udp:$h $p $up"$'\n'
+      [[ $up == true && $p == 19132 ]] && info_jobs+=("udp $h $p")
     done < <(printf '%s\n' "${udp_pairs[@]}" | xargs -P 16 -n 2 bash "$SELF" ping-mc 2>/dev/null)
   fi
-  printf '%s\n' "$out" |
+  local base
+  base=$(printf '%s\n' "$out" |
     awk 'NF==3 {printf "{\"key\":\"%s:%s\",\"up\":%s}\n", $1, $2, $3}' |
-    jq -s 'map({(.key): .up}) | add // {}'
+    jq -s 'map({(.key): .up}) | add // {}')
+
+  # Bedrock probes get identity data too: the same /v1/join request clients
+  # make (NetherNet) or a RakNet ping (older servers), attached as
+  # "<key>:info" so the panel can show player counts. probe-many only ever
+  # runs for pinned entries, and this is capped, so a 15 s tick stays cheap.
+  ((${#info_jobs[@]} > 4)) && info_jobs=("${info_jobs[@]:0:4}")
+  local enriched="" item proto2 h2 p2 fields name level players max
+  for item in "${info_jobs[@]}"; do
+    read -r proto2 h2 p2 <<<"$item"
+    name=""; level=""; players=0; max=0
+    if [[ $proto2 == udp ]]; then
+      fields=$(bash "$SELF" mc-info "$h2" "$p2" 2>/dev/null)
+      [[ -n $fields ]] && IFS=$'\x1f' read -r _ _ name _ players max <<<"$fields"
+      key="udp:$h2:$p2:info"
+    else
+      fields=$(bash "$SELF" nether-info "$h2" "$p2" 2>/dev/null)
+      [[ -n $fields ]] && IFS=$'\x1f' read -r _ _ name level players max <<<"$fields"
+      key="$h2:$p2:info"
+    fi
+    [[ -n ${name:-} ]] || continue
+    players=$(printf '%s' "${players:-0}" | tr -cd '0-9'); players=${players:-0}
+    max=$(printf '%s' "${max:-0}" | tr -cd '0-9'); max=${max:-0}
+    enriched+=$(jq -nc --arg key "$key" --arg title "$name" --arg level "${level:-}" \
+      --argjson players "$players" --argjson max "$max" \
+      '{($key): {title:$title, level:$level, players:$players, maxPlayers:$max}}')$'\n'
+  done
+  if [[ -n $enriched ]]; then
+    printf '%s\n%s' "$base" "$enriched" | jq -s 'add'
+  else
+    printf '%s\n' "$base"
+  fi
 }
 
 case "${1:-}" in

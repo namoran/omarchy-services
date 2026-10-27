@@ -443,6 +443,36 @@ test("remote entry state and summary use the udp probe namespace", () => {
   assert.deepEqual(Model.summary([entry], up), { total: 1, running: 1, issues: 0 })
 })
 
+test("pinned minecraft probes surface player counts from probe-many info", () => {
+  const entry = { type: "probe", host: "box", port: 19132, name: "Minecraft Bedrock", pinned: true }
+  const entries = [Object.assign({ id: "probe:box:19132" }, entry)]
+  // Without info: plain state, no player text.
+  const plain = Model.pinnedRows(entries, { probes: { "box:19132": true } })
+  assert.equal(plain[0].subtitle.indexOf("players"), -1)
+
+  const withInfo = Model.pinnedRows(entries, { probes: {
+    "box:19132": true,
+    "box:19132:info": { title: "MoranFamily", level: "Bedrock level", players: 2, maxPlayers: 8 }
+  } })
+  assert.equal(withInfo[0].state, "active")
+  assert.match(withInfo[0].subtitle, /2\/8 players/)
+
+  // Remote entries attach the same info via their probePort/probeProto.
+  const remote = [Object.assign({
+    id: "remote:desktop.example:minecraft-bedrock-server-ctl",
+    type: "remote", host: "desktop.example", user: "nam",
+    script: "/opt/bedrock/minecraft-bedrock-server-ctl",
+    name: "Minecraft Bedrock", probePort: 19132, probeProto: "tcp", pinned: true
+  })]
+  const remoteRows = Model.pinnedRows(remote, { probes: {
+    "desktop.example:19132": true,
+    "desktop.example:19132:info": { title: "MoranFamily", level: "Bedrock level", players: 0, maxPlayers: 10 }
+  } })
+  assert.equal(remoteRows[0].state, "active")
+  assert.match(remoteRows[0].subtitle, /remote · desktop\.example · nam/)
+  assert.match(remoteRows[0].subtitle, /0\/10 players/)
+})
+
 test("minecraft services are labelled with MOTD and player counts", () => {
   assert.equal(Model.portLabel(19132), "Minecraft Bedrock")
   assert.equal(Model.portLabel(25565), "Minecraft Java")
